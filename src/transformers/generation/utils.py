@@ -2594,6 +2594,8 @@ class GenerationMixin:
 
         # keep track of which sequences are already finished
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+        ret_tensors = [None] * input_ids.shape[0]
+        idx_map = [x for x in range(input_ids.shape[0])]
 
         this_peer_finished = False  # used by synced_gpus only
         # auto-regressive generation
@@ -2650,11 +2652,11 @@ class GenerationMixin:
             probs = nn.functional.softmax(next_token_scores, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-            # finished sentences should have their next token be a padding token
-            if eos_token_id is not None:
-                if pad_token_id is None:
-                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+            ## finished sentences should have their next token be a padding token
+            #if eos_token_id is not None:
+            #    if pad_token_id is None:
+            #        raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+            #    next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
@@ -2666,23 +2668,55 @@ class GenerationMixin:
 
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id_tensor is not None:
-                unfinished_sequences = unfinished_sequences.mul(
-                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
-                )
-
-                # stop when each sentence is finished
-                if unfinished_sequences.max() == 0:
-                    this_peer_finished = True
+                past_key_values = model_kwargs.get("past_key_values")
+                unfinished = next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0).cpu()
+                next_iter_inputs = []
+                next_idx_map = [None] * input_ids.shape[0]
+                saved_idxs = []
+                for idx in range(input_ids.shape[0]):
+                    if unfinished[idx]:
+                        next_iter_inputs.append(input_ids[idx])
+                        next_idx_map[len(next_iter_inputs)-1] = idx_map[idx]
+                        saved_idxs.append(idx)
+                    else:
+                        ret_tensors[idx_map[idx]] = input_ids[idx]
+                    saved_idxs = torch.IntTensor(saved_idxs).to(input_ids.device)
+                    position_ids = model_kwargs.get("position_ids")
+                    if position_ids is not None:
+                        model_kwargs["position_ids"] = position_ids[:len(saved_idxs),...]
+                    if "attention_mask" in model_kwargs:
+                        attention_mask = model_kwargs["attention_mask"]
+                        model_kwargs["attention_mask"] = attention_mask[:len(saved_idxs),...]
+                    if past_key_values is not None:
+                        next_past_kv = []
+                        for layer in range(len(past_key_values)):
+                            temp = []
+                            k = past_key_values[layer][0]
+                            v = past_key_values[layer][1]
+                            k = torch.index_select(k,dim=1,index=saved_idxs)
+                            v = torch.index_select(v,dim=1,index=saved_idxs)
+                            next_past_kv.append((k,v))
+                        model_kwargs["past_key_values"] = tuple(next_past_kv)
+                        
 
             # stop if we exceed the maximum length
-            if stopping_criteria(input_ids, scores):
+            if unfinished.max() == 0 or stopping_criteria(input_ids, scores):
+                if len(next_iter_inputs) > 0:
+                    for idx in range(len(next_iter_inputs)):
+                        ret_tensors[next_idx_map[idx]] = next_iter_inputs[idx]
+                for t in ret_tensors:
+                    assert t is not None
+                    
                 this_peer_finished = True
 
             if this_peer_finished and not synced_gpus:
                 break
+            idx_map = next_idx_map
+            input_ids = torch.stack(next_iter_inputs)
 
         if streamer is not None:
             streamer.end()
+        input_ids = torch.nn.utils.rnn.pad_sequence(ret_tensors,batch_first=True,padding_value=pad_token_id)
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:
